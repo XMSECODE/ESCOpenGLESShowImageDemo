@@ -33,6 +33,8 @@
 
 @property(nonatomic,assign)GLuint mGLUniformTexture;
 
+@property(nonatomic,strong)dispatch_queue_t openglesQueue;
+
 @end
 
 @implementation ESCOpenGLESView
@@ -55,6 +57,7 @@
 }
 
 - (void)setupOPENGLES {
+    self.openglesQueue = dispatch_queue_create("openglesqueue", DISPATCH_QUEUE_SERIAL);
     //设置layer属性
     CAEAGLLayer *eaglLayer = (CAEAGLLayer *)self.layer;
     NSDictionary *dict = @{kEAGLDrawablePropertyRetainedBacking:@(NO),
@@ -113,16 +116,13 @@
     GLenum glError = glGetError();
     if (GL_NO_ERROR != glError) {
         NSLog(@"failed to setup GL %x", glError);
-        return;
     }
-    return;
 }
 
+#pragma mark - 编译GPU程序
 - (void)setupGPUProgram {
-    GLuint vertexShader = [self compileShader:@"vertexshader.vs" withType:GL_VERTEX_SHADER];
-    
-    
-    GLuint fragmentShader = [self compileShader:@"fragmentshader.fs" withType:GL_FRAGMENT_SHADER];
+    GLuint vertexShader = [self compileShader:@"vertexshader.vtsd" withType:GL_VERTEX_SHADER];
+    GLuint fragmentShader = [self compileShader:@"fragmentshader.fmsd" withType:GL_FRAGMENT_SHADER];
     
     GLuint programHandle = glCreateProgram();
     glAttachShader(programHandle, vertexShader);
@@ -151,80 +151,6 @@
     _mGLUniformTexture = glGetUniformLocation(programHandle, "texSampler");
     
 }
-
-- (void)showRendbuffer {
-    [self.context presentRenderbuffer:GL_RENDERBUFFER];
-    
-    //解绑纹理
-    glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-- (void)loadImage:(UIImage *)image {
-    
-    glClearColor(1, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    //创建纹理
-    glGenTextures(1, &_texture);
-    //绑定纹理
-    glBindTexture(GL_TEXTURE_2D, _texture);
-    
-    //设置过滤参数
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    
-    //设置映射规则
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
-    //获取图片RGBA数据
-    void *pixels = NULL;
-    NSInteger lenth;
-    [self getImageRGBAData:image data:&pixels lenth:&lenth];
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image.size.width, image.size.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    
-    glViewport(0, 0, self.frame.size.width, self.frame.size.height);
-    
-    //设置物体坐标
-    GLfloat vertices[] = {
-        -1.0,-1.0,
-        1.0,-1.0,
-        -1.0,1.0,
-        1.0,1.0
-    };
-    glVertexAttribPointer(_mGLPosition, 2, GL_FLOAT, 0, 0, vertices);
-//    glEnableVertexAttribArray(_mGLPosition);
-
-    //设置纹理坐标
-//        GLfloat texCoords1[] = {
-//            0,0,
-//            1,0,
-//            0,1,
-//            1,1
-//        };
-    GLfloat texCoords2[] = {
-        0,1,
-        1,1,
-        0,0,
-        1,0
-    };
-    glVertexAttribPointer(_mGLTextureCoords, 2, GL_FLOAT, 0, 0, texCoords2);
-//    glEnableVertexAttribArray(_mGLTextureCoords);
-    
-    //传递纹理对象
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, _texture);
-    glUniform1i(_mGLUniformTexture, 0);
-    
-    //执行绘制操作
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    [self showRendbuffer];
-
-    //删除不使用纹理
-    glDeleteTextures(1, &_texture);
-    
-}
-
-
 
 - (GLuint)compileShader:(NSString *)shaderName withType:(GLenum)shaderType {
     NSString *shaderPath = [[NSBundle mainBundle] pathForResource:shaderName ofType:nil];
@@ -256,13 +182,93 @@
         glGetShaderInfoLog(shaderHandle, sizeof(message), 0, &message[0]);
         NSString *messageStr = [NSString stringWithUTF8String:message];
         NSLog(@"----%@", messageStr);
-        exit(1);
+        return 0;
     }
     
     return shaderHandle;
 }
 
-- (void)getImageRGBAData:(UIImage *)image data:(void * *)data lenth:(NSInteger *)lenth {
+- (void)createTexWithImage:(UIImage *)image {
+    //创建纹理
+    glGenTextures(1, &_texture);
+    //绑定纹理
+    glBindTexture(GL_TEXTURE_2D, _texture);
+    
+    //设置过滤参数
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    
+    //设置映射规则
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    
+    //获取图片RGBA数据
+    void *pixels = NULL;
+    [self getImageRGBAData:image data:&pixels];
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image.size.width, image.size.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    free(pixels);
+}
+
+#pragma mark - 通过opengles加载image
+
+- (void)shaderImage:(UIImage *)image {
+    BOOL result = [EAGLContext setCurrentContext:self.context];
+    if (result == NO) {
+        NSLog(@"set context failed!");
+    }
+    if (self.texture) {
+        glDeleteTextures(1, &_texture);
+    }
+    
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    [self createTexWithImage:image];
+    
+    glViewport(0, 0, self.frame.size.width, self.frame.size.height);
+    
+    //设置物体坐标
+    GLfloat vertices[] = {
+        -1.0,-1.0,
+        1.0,-1.0,
+        -1.0,1.0,
+        1.0,1.0
+    };
+    glVertexAttribPointer(_mGLPosition, 2, GL_FLOAT, 0, 0, vertices);
+    
+    //设置纹理坐标
+    GLfloat texCoords2[] = {
+        0,1,
+        1,1,
+        0,0,
+        1,0
+    };
+    glVertexAttribPointer(_mGLTextureCoords, 2, GL_FLOAT, 0, 0, texCoords2);
+    
+    //传递纹理对象
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, _texture);
+    glUniform1i(_mGLUniformTexture, 0);
+    
+    //执行绘制操作
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    
+    [self.context presentRenderbuffer:GL_RENDERBUFFER];
+    
+    //删除不使用纹理
+    glDeleteTextures(1, &_texture);
+    //解绑纹理
+    glBindTexture(GL_TEXTURE_2D, 0);
+    
+}
+- (void)loadImage:(UIImage *)image {
+    dispatch_async(self.openglesQueue, ^{
+        [self shaderImage:image];
+    });
+}
+
+#pragma mark - 获取图片RGBA数据
+- (void)getImageRGBAData:(UIImage *)image data:(void * *)data {
     CGImageAlphaInfo alphaInfo = CGImageGetAlphaInfo(image.CGImage);
     CGColorSpaceRef colorRef = CGColorSpaceCreateDeviceRGB();
     
@@ -281,7 +287,6 @@
     CGContextRelease(imageContext);
     CGColorSpaceRelease(colorRef);
     *data = imageData;
-    *lenth = width * height * 4;
 }
 
 @end
